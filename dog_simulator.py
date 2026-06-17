@@ -217,12 +217,15 @@ class RobotDog:
         cv2.putText(canvas, "Robot Dog", (20, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, TEXT_COLOR, 2)
 
-        # ---- 旋转动画（旋转整个画布，HUD 不旋转）----
+        # ---- 旋转动画（水平左右翻转，模拟狗狗原地转身）----
         rotating = abs(self.rot_angle - self.rot_target) > 0.5 or abs(self.rot_angle) > 0.5
         if rotating and abs(self.rot_angle) > 0.5:
             dog_cx = (body[0][0] + body[1][0]) // 2
-            dog_cy = (body[0][1] + body[3][1]) // 2
-            M = cv2.getRotationMatrix2D((dog_cx, dog_cy), self.rot_angle, 1.0)
+            # 水平缩放: cos(angle)→1→-1→1，产生左右翻转效果
+            import math
+            scale_x = math.cos(math.radians(self.rot_angle))
+            M = np.float32([[scale_x, 0, dog_cx * (1 - scale_x)],
+                            [0, 1, 0]])
             canvas[:] = cv2.warpAffine(canvas, M, (self.w, self.h),
                                         borderMode=cv2.BORDER_CONSTANT,
                                         borderValue=BG_COLOR)
@@ -236,7 +239,7 @@ class RobotDog:
         else:
             state = f"MOVING..."
         if rotating and abs(self.rot_angle) > 10:
-            state += " + SPINNING"
+            state += " + TURNING"
         cv2.putText(canvas, f"State: {state}", (20, 60),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_COLOR, 1)
 
