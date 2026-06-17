@@ -19,31 +19,28 @@
 
 import cv2
 import mediapipe as mp
+from mediapipe.tasks import python as mp_tasks
+from mediapipe.tasks.python.vision import (
+    HandLandmarker,
+    HandLandmarkerOptions,
+    HandLandmarksConnections,
+    RunningMode,
+)
+from mediapipe.tasks.python import BaseOptions
 import numpy as np
 import time
 import sys
+import os
 
 from gesture_detector import GestureDetector, GestureResult
+from mqtt_publisher import MqttPublisher
 import config
 
-
-# ============================================================
-# MediaPipe 手部连接关系（用于绘制骨架）
-# ============================================================
-HAND_CONNECTIONS = [
-    # 拇指
-    (0, 1), (1, 2), (2, 3), (3, 4),
-    # 食指
-    (0, 5), (5, 6), (6, 7), (7, 8),
-    # 中指
-    (0, 9), (9, 10), (10, 11), (11, 12),
-    # 无名指
-    (0, 13), (13, 14), (14, 15), (15, 16),
-    # 小指
-    (0, 17), (17, 18), (18, 19), (19, 20),
-    # 手掌横向连接
-    (5, 9), (9, 13), (13, 17),
-]
+# 模型文件路径 —— 优先放在不含中文的目录（MediaPipe C++ 层编码限制）
+#   本地路径作为备用（Linux/Mac 上无此问题）
+_MODEL_PATH_LOCAL = os.path.join(os.path.dirname(__file__), 'hand_landmarker.task')
+_MODEL_PATH_SAFE = os.path.join(os.path.expanduser('~'), '.claude', 'models', 'hand_landmarker.task')
+_MODEL_PATH = _MODEL_PATH_SAFE if os.path.exists(_MODEL_PATH_SAFE) else _MODEL_PATH_LOCAL
 
 
 class Visualizer:
@@ -65,8 +62,8 @@ class Visualizer:
 
         Args:
             image: 原始BGR图像
-            landmarks: MediaPipe手部关键点（归一化坐标）
-            result: 当前帧手势检测结果
+            landmarks: MediaPipe手部关键点（归一化坐标），可为 None
+            result: 当前帧手势检测结果，可为 None
             detector: 手势检测器（用于获取轨迹历史）
             fps: 当前帧率
 
@@ -98,8 +95,8 @@ class Visualizer:
             self._draw_hand_skeleton(image, landmarks, h, w, state_color)
             self._draw_landmark_labels(image, landmarks, h, w)
 
-        # ---- 绘制状态面板（返回新图像，因为叠加操作创建新数组）----
-        image = self._draw_status_panel(image, state_text, state_color, fps, result, detector)
+        # ---- 绘制状态面板 ----
+        image = self._draw_status_panel(image, state_text, state_color, fps, result)
 
         # ---- 触发闪烁效果 ----
         if result is not None and result.command == 'SIT':
@@ -107,40 +104,48 @@ class Visualizer:
 
         return image
 
-    def _draw_trail(self, image, trail):
-        """绘制手腕运动轨迹（带渐隐效果）"""
+    # ------------------------------------------------------------------
+    # 轨迹绘制
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _draw_trail(image, trail):
+        """绘制手腕运动轨迹（带渐隐效果，最新点最亮）"""
         pts = list(trail)
         n = len(pts)
         if n < 2:
             return
 
         for i in range(1, n):
-            alpha = i / n  # 越近越亮
+            # alpha: 最新线段 = 1.0, 最旧线段 ≈ 1/(n-1)
+            alpha = i / (n - 1)
             color = tuple(int(c * alpha) for c in config.COLOR_TRAIL)
             pt1 = (int(pts[i - 1][0]), int(pts[i - 1][1]))
             pt2 = (int(pts[i][0]), int(pts[i][1]))
             cv2.line(image, pt1, pt2, color, 2, cv2.LINE_AA)
 
-    def _draw_hand_skeleton(self, image, landmarks, h, w, color):
-        """绘制手部骨架连线"""
-        # 先画连线
-        for start_idx, end_idx in HAND_CONNECTIONS:
-            x1 = int(landmarks[start_idx].x * w)
-            y1 = int(landmarks[start_idx].y * h)
-            x2 = int(landmarks[end_idx].x * w)
-            y2 = int(landmarks[end_idx].y * h)
-            cv2.line(image, (x1, y1), (x2, y2), color, 2, cv2.LINE_AA)
+    # ------------------------------------------------------------------
+    # 手部骨架绘制
+    # ------------------------------------------------------------------
 
-        # 再画关键点
-        for lm in landmarks:
-            cx = int(lm.x * w)
-            cy = int(lm.y * h)
-            cv2.circle(image, (cx, cy), config.LANDMARK_CIRCLE_RADIUS, color, -1, cv2.LINE_AA)
+    @staticmethod
+    def _draw_hand_skeleton(image, landmarks, h, w, color):
+        """绘制手部骨架连线（预计算像素坐标，避免重复计算）"""
+        # 一次性预计算所有 21 个关键点的像素坐标
+        px = [(int(lm.x * w), int(lm.y * h)) for lm in landmarks]
+
+        # 画连线（Tasks API 的 Connection 使用 .start / .end）
+        for conn in HandLandmarksConnections.HAND_CONNECTIONS:
+            cv2.line(image, px[conn.start], px[conn.end], color, 2, cv2.LINE_AA)
+
+        # 画关键点
+        for cx, cy in px:
+            cv2.circle(image, (cx, cy), config.LANDMARK_CIRCLE_RADIUS,
+                       color, -1, cv2.LINE_AA)
 
         # 手腕用更大的圆突出显示
-        wrist_x = int(landmarks[0].x * w)
-        wrist_y = int(landmarks[0].y * h)
-        cv2.circle(image, (wrist_x, wrist_y), config.LANDMARK_CIRCLE_RADIUS + 3,
+        wx, wy = px[0]
+        cv2.circle(image, (wx, wy), config.LANDMARK_CIRCLE_RADIUS + 3,
                    color, 2, cv2.LINE_AA)
 
     def _draw_landmark_labels(self, image, landmarks, h, w):
@@ -153,15 +158,21 @@ class Visualizer:
             cv2.putText(image, str(i), (cx + 5, cy - 5),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 255, 255), 1)
 
-    def _draw_status_panel(self, image, state_text, state_color, fps, result, detector):
-        """绘制状态信息面板（返回叠加后的图像）"""
-        h, w = image.shape[:2]
+    # ------------------------------------------------------------------
+    # 状态面板
+    # ------------------------------------------------------------------
 
-        # 半透明背景面板
-        overlay = image.copy()
+    def _draw_status_panel(self, image, state_text, state_color, fps, result):
+        """绘制状态信息面板（ROI 局部叠加，避免全帧拷贝）"""
+        h, w = image.shape[:2]
         panel_h = 120 if self.debug_mode else 90
+
+        # 仅对面板区域做半透明叠加（而非全帧 copy + addWeighted）
+        roi = image[0:panel_h, 0:w]
+        overlay = roi.copy()
         cv2.rectangle(overlay, (0, 0), (w, panel_h), (0, 0, 0), -1)
-        image = cv2.addWeighted(overlay, 0.5, image, 0.5, 0)
+        blended = cv2.addWeighted(overlay, 0.5, roi, 0.5, 0)
+        image[0:panel_h, 0:w] = blended
 
         y_offset = 25
 
@@ -201,12 +212,15 @@ class Visualizer:
 
         return image
 
-    def _draw_trigger_flash(self, image):
-        """触发指令时的红色闪烁边框"""
+    # ------------------------------------------------------------------
+    # 触发闪烁
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _draw_trigger_flash(image):
+        """触发指令时的红色闪烁边框 + 中央大字"""
         h, w = image.shape[:2]
-        thickness = 8
-        cv2.rectangle(image, (0, 0), (w, h), config.COLOR_TRIGGERED, thickness)
-        # 中央大字提示
+        cv2.rectangle(image, (0, 0), (w, h), config.COLOR_TRIGGERED, 8)
         text = "SIT! / 坐下!"
         text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 1.5, 3)[0]
         tx = (w - text_size[0]) // 2
@@ -215,8 +229,31 @@ class Visualizer:
                     cv2.FONT_HERSHEY_SIMPLEX, 1.5, config.COLOR_TRIGGERED, 3)
 
 
+# ======================================================================
+# 摄像头初始化
+# ======================================================================
+
+def download_model():
+    """下载 MediaPipe 手部关键点模型（.task 文件）"""
+    if os.path.exists(_MODEL_PATH):
+        return
+
+    import urllib.request
+    url = ('https://storage.googleapis.com/mediapipe-models/'
+           'hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task')
+    print(f"[INFO] 正在下载手部关键点模型...")
+    print(f"  {url}")
+    try:
+        urllib.request.urlretrieve(url, _MODEL_PATH)
+        print(f"[INFO] 模型已下载: {_MODEL_PATH}")
+    except Exception as e:
+        print(f"[ERROR] 模型下载失败: {e}")
+        print("  请手动下载并放置到:", _MODEL_PATH)
+        sys.exit(1)
+
+
 def init_camera():
-    """初始化摄像头"""
+    """初始化摄像头，返回 (cap, actual_w, actual_h)"""
     cap = cv2.VideoCapture(config.CAMERA_INDEX)
     if not cap.isOpened():
         print(f"[ERROR] 无法打开摄像头 (index={config.CAMERA_INDEX})")
@@ -227,13 +264,17 @@ def init_camera():
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.CAMERA_HEIGHT)
     cap.set(cv2.CAP_PROP_FPS, config.CAMERA_FPS)
 
-    actual_w = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
-    actual_h = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+    actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     actual_fps = cap.get(cv2.CAP_PROP_FPS)
-    print(f"[INFO] 摄像头已打开: {actual_w:.0f}x{actual_h:.0f} @ {actual_fps:.0f}fps")
+    print(f"[INFO] 摄像头已打开: {actual_w}x{actual_h} @ {actual_fps:.0f}fps")
 
-    return cap
+    return cap, actual_w, actual_h
 
+
+# ======================================================================
+# 主循环
+# ======================================================================
 
 def main():
     print("=" * 60)
@@ -241,29 +282,39 @@ def main():
     print("  手势: 平摊手掌向下挥 → 机械狗坐下")
     print("=" * 60)
     print()
-    print("[INFO] 初始化 MediaPipe Hands...")
 
-    # ---- 初始化 ----
-    mp_hands = mp.solutions.hands
-    hands = mp_hands.Hands(
-        static_image_mode=config.STATIC_IMAGE_MODE,
-        max_num_hands=config.MAX_NUM_HANDS,
-        min_detection_confidence=config.MIN_DETECTION_CONFIDENCE,
-        min_tracking_confidence=config.MIN_TRACKING_CONFIDENCE,
-        model_complexity=config.MODEL_COMPLEXITY,
-    )
+    # ---- 下载模型 ----
+    download_model()
+
+    print("[INFO] 初始化 MediaPipe HandLandmarker...")
+
+    # ---- 初始化 MediaPipe HandLandmarker（Tasks API）----
+    try:
+        options = HandLandmarkerOptions(
+            base_options=BaseOptions(model_asset_path=_MODEL_PATH),
+            running_mode=RunningMode.VIDEO,
+            num_hands=config.MAX_NUM_HANDS,
+            min_hand_detection_confidence=config.MIN_DETECTION_CONFIDENCE,
+            min_tracking_confidence=config.MIN_TRACKING_CONFIDENCE,
+        )
+        hand_landmarker = HandLandmarker.create_from_options(options)
+    except Exception as e:
+        print(f"[ERROR] MediaPipe HandLandmarker 初始化失败: {e}")
+        print("  请检查模型文件是否存在:", _MODEL_PATH)
+        sys.exit(1)
 
     detector = GestureDetector()
     visualizer = Visualizer()
-
-    cap = init_camera()
+    mqtt = MqttPublisher()
+    mqtt.connect()  # 非阻塞，后台连接
+    cap, cam_w, cam_h = init_camera()
 
     print("[INFO] 初始化完成，开始手势检测...")
     print("[INFO] 请对着摄像头做「平摊手掌向下挥」手势")
     print()
 
-    # ---- FPS 计时 ----
-    fps_start_time = time.time()
+    # ---- FPS 计时（使用 monotonic 免疫时钟跳变）----
+    fps_start_time = time.monotonic()
     fps_frame_count = 0
     current_fps = 0.0
 
@@ -273,42 +324,56 @@ def main():
             ret, frame = cap.read()
             if not ret:
                 print("[WARN] 读取帧失败，跳过...")
+                cv2.waitKey(1)
+                time.sleep(0.01)
                 continue
 
             # 镜像翻转（更自然）
             frame = cv2.flip(frame, 1)
 
-            # BGR → RGB（MediaPipe 需要 RGB 输入）
+            # 使用实际帧尺寸（而非 config 的硬编码值）
+            actual_h, actual_w = frame.shape[:2]
+
+            # BGR → RGB，创建 MediaPipe Image
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            rgb_frame.flags.writeable = False  # 性能优化：标记为不可写
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
 
-            # ---- MediaPipe 手部检测 ----
-            mp_result = hands.process(rgb_frame)
+            # ---- MediaPipe 手部检测（Tasks API）----
+            mp_result = hand_landmarker.detect_for_video(mp_image, int(time.monotonic() * 1000))
 
-            rgb_frame.flags.writeable = True
-
-            # ---- 手势检测 ----
-            if mp_result.multi_hand_landmarks:
-                # 只取第一只手（config.MAX_NUM_HANDS=1）
-                hand_landmarks = mp_result.multi_hand_landmarks[0]
+            # ---- 手势检测（无论有无手部都调用 detect）----
+            if mp_result.hand_landmarks:
+                hand_landmarks = mp_result.hand_landmarks[0]
                 result = detector.detect(
-                    hand_landmarks.landmark,
-                    config.CAMERA_HEIGHT,
-                    config.CAMERA_WIDTH,
+                    hand_landmarks,
+                    actual_h,
+                    actual_w,
                 )
-
-                # ---- 指令输出 ----
-                if result is not None and result.command == 'SIT':
-                    print(f"  🐕 机械狗坐下!  "
-                          f"(速度={result.velocity:.4f}, 位移={result.displacement:.4f})")
+                if result is not None and result.command:
+                    cmd = result.command
+                    if cmd == 'SIT':
+                        print(f"  🐕 坐下!  "
+                              f"(v={result.velocity:.4f}, d={result.displacement:.4f})")
+                        mqtt.send_sit(velocity=result.velocity,
+                                      displacement=result.displacement)
+                    elif cmd == 'STAND':
+                        print(f"  🐕 站立!  "
+                              f"(v={result.velocity:.4f}, d={result.displacement:.4f})")
+                        mqtt.send_stand(velocity=result.velocity,
+                                        displacement=result.displacement)
+                    elif cmd == 'ROTATE':
+                        print(f"  🐕 旋转!  "
+                              f"(角度={result.circle_angle:.0f}°)")
+                        mqtt.send_rotate(angle=result.circle_angle)
             else:
                 hand_landmarks = None
-                result = None
+                # 传入 None 清空滑动窗口，防止手部再现时误触发
+                result = detector.detect(None, actual_h, actual_w)
 
             # ---- 可视化 ----
             display_frame = visualizer.draw(
                 frame,
-                hand_landmarks.landmark if hand_landmarks else None,
+                hand_landmarks,
                 result,
                 detector,
                 current_fps,
@@ -316,11 +381,11 @@ def main():
 
             # ---- FPS 计算 ----
             fps_frame_count += 1
-            elapsed = time.time() - fps_start_time
+            elapsed = time.monotonic() - fps_start_time
             if elapsed >= 1.0:
                 current_fps = fps_frame_count / elapsed
                 fps_frame_count = 0
-                fps_start_time = time.time()
+                fps_start_time = time.monotonic()
 
             # ---- 显示 ----
             cv2.imshow("Gesture Control - Sit Detection", display_frame)
@@ -342,7 +407,8 @@ def main():
     finally:
         cap.release()
         cv2.destroyAllWindows()
-        hands.close()
+        hand_landmarker.close()
+        mqtt.disconnect()
         print("[INFO] 资源已释放，程序结束")
 
 

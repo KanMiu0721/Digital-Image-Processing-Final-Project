@@ -1,18 +1,30 @@
 """
 手势检测核心模块
 
-实现两大核心功能：
-1. 手掌平摊静态判定 —— 基于手指伸直程度（距离比值法）
-2. 手掌向下挥动轨迹分析 —— 基于手腕关键点的滑动窗口 + Savitzky-Golay滤波
+支持三种手势：
+1. 平摊手掌向下挥 → SIT（坐下）
+2. 平摊手掌向上挥 → STAND（站立）
+3. 握拳画圈 → ROTATE（旋转）
+
+检测方法：
+- 手掌形状：距离比值法（math.hypot 零分配）
+- 垂直运动：滑动窗口 + Savitzky-Golay 滤波
+- 圆形轨迹：累计转角法（滑动窗口内角度积分）
 """
 
+import math
 import numpy as np
 from collections import deque
 from dataclasses import dataclass
-from typing import Optional, List, Tuple
+from typing import Optional, Tuple
 import time
 
-from scipy.signal import savgol_filter
+# ---- scipy 安全导入 ----
+try:
+    from scipy.signal import savgol_filter
+    _HAS_SCIPY = True
+except ImportError:
+    _HAS_SCIPY = False
 
 import config
 
@@ -20,217 +32,238 @@ import config
 @dataclass
 class GestureResult:
     """手势检测结果"""
-    command: Optional[str]          # 触发指令 ('SIT') 或 None
-    is_palm_flat: bool              # 当前帧是否手掌平摊
-    is_moving_down: bool            # 当前窗口是否向下挥动
-    velocity: float                 # 当前速度（归一化坐标/帧）
-    displacement: float             # 窗口内总位移
-    extended_fingers: int           # 伸直的手指数量
-    timestamp: float                # 时间戳
+    command: Optional[str]          # 'SIT' / 'STAND' / 'ROTATE' / None
+    is_palm_flat: bool
+    is_fist: bool                   # 是否握拳
+    is_moving_down: bool
+    is_moving_up: bool
+    is_circling: bool               # 是否在画圈
+    velocity: float
+    displacement: float
+    circle_angle: float             # 画圈累计角度（度）
+    extended_fingers: int
+    timestamp: float
 
 
 class GestureDetector:
-    """
-    手势检测器
+    """多手势检测器"""
 
-    采用状态机模式跟踪手势序列：
-    - 持续检测手掌平摊状态
-    - 在滑动窗口内分析手腕垂直运动
-    - 两个条件同时满足时触发指令
-
-    使用方法:
-        detector = GestureDetector()
-        result = detector.detect(landmarks, height, width)
-        if result.command == 'SIT':
-            print("机械狗坐下!")
-    """
-
-    # MediaPipe 手指关键点索引: (MCP, PIP, DIP, TIP)
     FINGER_INDICES = [
-        (5, 6, 7, 8),      # 食指 Index
-        (9, 10, 11, 12),   # 中指 Middle
-        (13, 14, 15, 16),  # 无名指 Ring
-        (17, 18, 19, 20),  # 小指 Pinky
+        (5, 6, 7, 8),      # 食指
+        (9, 10, 11, 12),   # 中指
+        (13, 14, 15, 16),  # 无名指
+        (17, 18, 19, 20),  # 小指
     ]
 
-    FINGER_NAMES = ["食指", "中指", "无名指", "小指"]
-
     def __init__(self):
-        # 手腕Y坐标历史（归一化值），用于滑动窗口分析
         self.wrist_y_history: deque = deque(maxlen=config.SLIDING_WINDOW_SIZE)
-        # 手腕轨迹历史（像素坐标），用于可视化
+        self.wrist_xy_history: deque = deque(maxlen=config.CIRCLE_WINDOW_SIZE)
         self.wrist_trail: deque = deque(maxlen=config.TRAIL_LENGTH)
-        # 上次触发时间（毫秒）
-        self.last_trigger_time: float = 0
-        # 当前帧状态
-        self.is_palm_flat: bool = False
-        self.is_moving_down: bool = False
-        self.extended_fingers: int = 0
-        # 采样计数（用于稳定滤波）
-        self.frame_count: int = 0
+        self.last_trigger_time: float = 0.0
+        self._prev_extended: int = -1     # 上一帧伸直手指数
+        self._suppress_down_until: float = 0.0   # 禁止 SIT 直到（monotonic ms）
+        self._suppress_up_until: float = 0.0     # 禁止 STAND 直到
+        self._fist_frame_count: int = 0          # 握拳连续帧数
 
-    def detect(
-        self,
-        landmarks,
-        image_height: int,
-        image_width: int
-    ) -> Optional[GestureResult]:
-        """
-        主检测入口：处理一帧手部关键点数据
+    # ------------------------------------------------------------------
+    # 公开接口
+    # ------------------------------------------------------------------
 
-        Args:
-            landmarks: MediaPipe NormalizedLandmark 列表（21个点）
-            image_height: 图像高度（像素）
-            image_width: 图像宽度（像素）
-
-        Returns:
-            GestureResult 或 None（无手部检测时）
-        """
+    def detect(self, landmarks, image_height: int, image_width: int) -> Optional[GestureResult]:
         if landmarks is None:
+            self.wrist_y_history.clear()
+            self.wrist_xy_history.clear()
             return None
 
-        self.frame_count += 1
+        # ---- 1. 手型判定 ----
+        is_palm_flat, extended_fingers = self._check_palm_flat(landmarks)
+        is_fist = (extended_fingers <= config.FIST_MAX_EXTENDED_FINGERS)
 
-        # ---- 1. 手掌平摊判定 ----
-        self.is_palm_flat, self.extended_fingers = self._check_palm_flat(landmarks)
+        # 手型切换时清空画圈历史（防止挥手轨迹误触发旋转）
+        shape_changed = (self._prev_extended >= 0 and
+                         ((self._prev_extended >= 3 and extended_fingers <= 0) or
+                          (self._prev_extended <= 0 and extended_fingers >= 3)))
+        if shape_changed:
+            self.wrist_xy_history.clear()
 
-        # ---- 2. 手腕轨迹记录 ----
+        # ---- 2. 手腕轨迹 ----
         wrist = landmarks[0]
-        wrist_y_norm = wrist.y  # MediaPipe已归一化到[0,1]
-        self.wrist_y_history.append(wrist_y_norm)
+        self.wrist_y_history.append(wrist.y)
+        self.wrist_xy_history.append((wrist.x, wrist.y))
+        self.wrist_trail.append((wrist.x * image_width, wrist.y * image_height))
 
-        # 保存像素坐标用于可视化轨迹
-        wrist_px = (wrist.x * image_width, wrist.y * image_height)
-        self.wrist_trail.append(wrist_px)
+        # ---- 3. 运动判定 ----
+        is_moving_down, is_moving_up, velocity, displacement = self._check_vertical_motion()
+        is_circling, circle_angle = self._check_circular_motion()
 
-        # ---- 3. 向下挥动判定 ----
-        self.is_moving_down, velocity, displacement = self._check_downward_motion()
+        self._prev_extended = extended_fingers
 
-        # ---- 4. 指令触发判定 ----
+        # ---- 4. 握拳帧计数（需连续N帧才允许画圈）----
+        if is_fist:
+            self._fist_frame_count += 1
+        else:
+            self._fist_frame_count = 0
+        fist_held = self._fist_frame_count >= config.FIST_HOLD_FRAMES
+
+        # ---- 5. 指令仲裁（优先级: ROTATE > STAND > SIT）----
         command = None
-        current_time = time.time() * 1000  # 毫秒
+        current_time = time.monotonic() * 1000.0
+        cooldown_ok = (current_time - self.last_trigger_time > config.TRIGGER_COOLDOWN_MS)
 
-        if self.is_palm_flat and self.is_moving_down:
-            if current_time - self.last_trigger_time > config.TRIGGER_COOLDOWN_MS:
-                command = 'SIT'
+        if cooldown_ok:
+            # ROTATE: 握拳+持续+画圈
+            if is_fist and fist_held and is_circling:
+                command = 'ROTATE'
+            elif is_palm_flat:
+                # SIT: 向下 且 不在反弹抑制期内
+                if is_moving_down and current_time > self._suppress_down_until:
+                    command = 'SIT'
+                # STAND: 向上 且 不在反弹抑制期内
+                elif is_moving_up and current_time > self._suppress_up_until:
+                    command = 'STAND'
+
+            if command is not None:
                 self.last_trigger_time = current_time
+                # 短时间抑制反方向（防手自然收回误触发），但不清理历史
+                if command == 'SIT':
+                    self._suppress_up_until = current_time + config.DIRECTION_SUPPRESS_MS
+                elif command == 'STAND':
+                    self._suppress_down_until = current_time + config.DIRECTION_SUPPRESS_MS
+                elif command == 'ROTATE':
+                    self.wrist_xy_history.clear()
 
         return GestureResult(
             command=command,
-            is_palm_flat=self.is_palm_flat,
-            is_moving_down=self.is_moving_down,
+            is_palm_flat=is_palm_flat,
+            is_fist=is_fist,
+            is_moving_down=is_moving_down,
+            is_moving_up=is_moving_up,
+            is_circling=is_circling,
             velocity=velocity,
             displacement=displacement,
-            extended_fingers=self.extended_fingers,
+            circle_angle=circle_angle,
+            extended_fingers=extended_fingers,
             timestamp=current_time,
         )
 
+    # ------------------------------------------------------------------
+    # 手型判定
+    # ------------------------------------------------------------------
+
     def _check_palm_flat(self, landmarks) -> Tuple[bool, int]:
-        """
-        检查手掌是否平摊（手指伸直）
-
-        方法：距离比值法
-        - 计算每根手指的指节路径总长度 与 指尖→指根直线距离 的比值
-        - 伸直手指：比值接近 1.0（直线距离 ≈ 路径长度）
-        - 弯曲手指：比值接近 0.0（直线距离 << 路径长度）
-
-        Returns:
-            (is_flat, extended_count): 是否平摊, 伸直手指数量
-        """
         extended_count = 0
-
         for mcp_idx, pip_idx, dip_idx, tip_idx in self.FINGER_INDICES:
             if self._is_finger_extended(landmarks, mcp_idx, pip_idx, dip_idx, tip_idx):
                 extended_count += 1
+        return extended_count >= config.MIN_EXTENDED_FINGERS, extended_count
 
-        is_flat = extended_count >= config.MIN_EXTENDED_FINGERS
-        return is_flat, extended_count
-
-    def _is_finger_extended(
-        self,
-        landmarks,
-        mcp_idx: int,
-        pip_idx: int,
-        dip_idx: int,
-        tip_idx: int
-    ) -> bool:
-        """
-        判断单根手指是否伸直（距离比值法）
-
-        几何原理：
-        - 伸直时 3段指节趋近共线：|MCP→TIP| ≈ |MCP→PIP| + |PIP→DIP| + |DIP→TIP|
-        - 弯曲时指尖回折：|MCP→TIP| << 路径总长
-        - ratio = 直线距离 / 路径总长，伸直时 → 1.0，弯曲时 → <0.5
-        """
-        mcp = np.array([landmarks[mcp_idx].x, landmarks[mcp_idx].y])
-        pip = np.array([landmarks[pip_idx].x, landmarks[pip_idx].y])
-        dip = np.array([landmarks[dip_idx].x, landmarks[dip_idx].y])
-        tip = np.array([landmarks[tip_idx].x, landmarks[tip_idx].y])
-
-        # 三段指节路径总长
-        path_length = (
-            np.linalg.norm(pip - mcp) +
-            np.linalg.norm(dip - pip) +
-            np.linalg.norm(tip - dip)
-        )
-
-        # 指尖到指根直线距离
-        direct_length = np.linalg.norm(tip - mcp)
-
+    @staticmethod
+    def _is_finger_extended(landmarks, mcp_idx, pip_idx, dip_idx, tip_idx) -> bool:
+        def _dist(a, b):
+            return math.hypot(b.x - a.x, b.y - a.y)
+        mcp = landmarks[mcp_idx]
+        pip = landmarks[pip_idx]
+        dip = landmarks[dip_idx]
+        tip = landmarks[tip_idx]
+        path_length = _dist(mcp, pip) + _dist(pip, dip) + _dist(dip, tip)
+        direct_length = _dist(mcp, tip)
         if path_length < 1e-6:
             return False
+        return direct_length / path_length > config.FINGER_EXTENSION_RATIO_THRESHOLD
 
-        ratio = direct_length / path_length
-        return ratio > config.FINGER_EXTENSION_RATIO_THRESHOLD
+    # ------------------------------------------------------------------
+    # 垂直运动判定（向上 + 向下）
+    # ------------------------------------------------------------------
 
-    def _check_downward_motion(self) -> Tuple[bool, float, float]:
+    def _check_vertical_motion(self) -> Tuple[bool, bool, float, float]:
         """
-        检查手掌是否向下挥动
-
-        方法：滑动窗口 + Savitzky-Golay 滤波
-        - 维护最近N帧的手腕Y坐标
-        - 对窗口数据做SG滤波平滑
-        - 计算滤波后的速度和总位移
-        - 速度 > 阈值 且 位移 > 阈值 → 判定为向下挥动
-
-        Returns:
-            (is_moving_down, velocity, displacement)
+        Returns: (is_moving_down, is_moving_up, velocity, displacement)
+        velocity > 0 = 向下, velocity < 0 = 向上
         """
         if len(self.wrist_y_history) < config.SLIDING_WINDOW_SIZE:
-            return False, 0.0, 0.0
+            return False, False, 0.0, 0.0
 
         y_values = np.array(self.wrist_y_history, dtype=np.float64)
+        smoothed = self._apply_filter(y_values)
 
-        # Savitzky-Golay 滤波 —— 抑制高频抖动，保留运动趋势
-        # 确保窗口长度不超过数据点数，且为奇数
+        displacement = float(smoothed[-1] - smoothed[0])
+        n_intervals = len(smoothed) - 1
+        velocity = displacement / n_intervals if n_intervals > 0 else 0.0
+
+        is_moving_down = (velocity > config.VELOCITY_THRESHOLD and
+                          displacement > config.DISPLACEMENT_THRESHOLD)
+        # 向上挥使用更低阈值（人向上挥天然比向下慢）
+        up_v = config.VELOCITY_THRESHOLD * config.UPWARD_THRESHOLD_RATIO
+        up_d = config.DISPLACEMENT_THRESHOLD * config.UPWARD_THRESHOLD_RATIO
+        is_moving_up = (velocity < -up_v and displacement < -up_d)
+        return is_moving_down, is_moving_up, velocity, displacement
+
+    # ------------------------------------------------------------------
+    # 画圈判定（累计转角法）
+    # ------------------------------------------------------------------
+
+    def _check_circular_motion(self) -> Tuple[bool, float]:
+        """
+        累计转角法：计算手腕轨迹在滑动窗口内的累计转向角度。
+        角度 > CIRCLE_ANGLE_THRESHOLD（默认300°）且轨迹半径够大 → 画圈。
+
+        Returns: (is_circling, total_angle_degrees)
+        """
+        if len(self.wrist_xy_history) < config.CIRCLE_WINDOW_SIZE:
+            return False, 0.0
+
+        pts = list(self.wrist_xy_history)
+
+        # 检查轨迹半径（过滤手抖微动）
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        cx = sum(xs) / len(xs)
+        cy = sum(ys) / len(ys)
+        max_radius = max(math.hypot(x - cx, y - cy) for x, y in pts)
+        if max_radius < config.CIRCLE_RADIUS_MIN:
+            return False, 0.0
+
+        # 累计转角
+        total_angle = 0.0
+        for i in range(len(pts) - 2):
+            a, b, c = pts[i], pts[i + 1], pts[i + 2]
+            v1 = (b[0] - a[0], b[1] - a[1])
+            v2 = (c[0] - b[0], c[1] - b[1])
+            cross = v1[0] * v2[1] - v1[1] * v2[0]
+            dot = v1[0] * v2[0] + v1[1] * v2[1]
+            total_angle += math.atan2(cross, dot)
+
+        total_deg = abs(math.degrees(total_angle))
+        is_circling = total_deg > config.CIRCLE_ANGLE_THRESHOLD
+        return is_circling, total_deg
+
+    # ------------------------------------------------------------------
+    # 滤波
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _apply_filter(y_values: np.ndarray) -> np.ndarray:
         window_len = min(config.SG_WINDOW_LENGTH, len(y_values))
         if window_len % 2 == 0:
             window_len -= 1
-        if window_len < 3:
-            # 数据不够，直接用原始值
-            smoothed = y_values
-        else:
-            smoothed = savgol_filter(y_values, window_len, config.SG_POLYORDER)
+        polyorder = config.SG_POLYORDER
+        if polyorder >= window_len:
+            polyorder = window_len - 1
+        if window_len < 3 or not _HAS_SCIPY:
+            kernel = np.ones(window_len) / window_len
+            return np.convolve(y_values, kernel, mode='same')
+        return savgol_filter(y_values, window_len, polyorder)
 
-        # 计算总位移（正=向下，Y轴在图像中朝下）
-        displacement = float(smoothed[-1] - smoothed[0])
-
-        # 平均每帧速度
-        velocity = displacement / len(smoothed)
-
-        is_moving_down = (
-            velocity > config.VELOCITY_THRESHOLD and
-            displacement > config.DISPLACEMENT_THRESHOLD
-        )
-
-        return is_moving_down, velocity, displacement
+    # ------------------------------------------------------------------
+    # 重置
+    # ------------------------------------------------------------------
 
     def reset(self):
-        """重置检测器状态"""
         self.wrist_y_history.clear()
+        self.wrist_xy_history.clear()
         self.wrist_trail.clear()
-        self.last_trigger_time = 0
-        self.is_palm_flat = False
-        self.is_moving_down = False
-        self.extended_fingers = 0
-        self.frame_count = 0
+        self.last_trigger_time = 0.0
+        self._prev_extended = -1
+        self._suppress_down_until = 0.0
+        self._suppress_up_until = 0.0
+        self._fist_frame_count = 0
