@@ -304,17 +304,26 @@ def main():
     client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="dog_simulator")
     client.on_connect = on_connect
     client.on_message = on_message
-    client.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
+
+    mqtt_ok = False
+    try:
+        client.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
+        mqtt_ok = True
+    except Exception as e:
+        print(f"[模拟器] MQTT 连接失败: {e}")
+        print("[模拟器] 将以键盘模式运行（S/W/T 键手动测试）")
+        print()
 
     canvas = np.zeros((WINDOW_H, WINDOW_W, 3), dtype=np.uint8)
     dog = RobotDog(WINDOW_W, WINDOW_H)
     client.user_data_set(dog)
-    client.loop_start()
+    if mqtt_ok:
+        client.loop_start()
 
     fps_timer = time.monotonic()
     frame_count = 0
 
-    print("[模拟器] 窗口已打开，等待手势指令... (q 退出)")
+    print("[模拟器] 窗口已打开 (q 退出)")
     print()
 
     try:
@@ -346,8 +355,9 @@ def main():
     except KeyboardInterrupt:
         print("\n[模拟器] Ctrl+C 退出...")
     finally:
-        client.loop_stop()
-        client.disconnect()
+        if mqtt_ok:
+            client.loop_stop()
+            client.disconnect()
         cv2.destroyAllWindows()
         print("[模拟器] 已关闭")
 

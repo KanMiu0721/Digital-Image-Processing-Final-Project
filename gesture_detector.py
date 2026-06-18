@@ -115,11 +115,14 @@ class GestureDetector:
             if is_fist and fist_held and is_circling:
                 command = 'ROTATE'
             elif is_palm_flat:
-                # SIT: 向下 且 不在反弹抑制期内
-                if is_moving_down and current_time > self._suppress_down_until:
+                # 静止起始判定：窗口最旧2帧Y值靠近 → 运动从静止开始，不是乱晃
+                y_list = list(self.wrist_y_history)
+                still_start = (max(y_list[:2]) - min(y_list[:2])) < config.STILL_DISPERSION_THRESHOLD
+                # SIT: 向下 + 静止起始 + 不在反弹抑制期内
+                if is_moving_down and still_start and current_time > self._suppress_down_until:
                     command = 'SIT'
-                # STAND: 向上 且 不在反弹抑制期内
-                elif is_moving_up and current_time > self._suppress_up_until:
+                # STAND: 向上 + 静止起始 + 不在反弹抑制期内
+                elif is_moving_up and still_start and current_time > self._suppress_up_until:
                     command = 'STAND'
 
             if command is not None:

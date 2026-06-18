@@ -49,6 +49,7 @@ CIRCLE_RADIUS_MIN = 0.04            # 最小画圈半径（归一化坐标），
 UPWARD_THRESHOLD_RATIO = 0.85       # 向上挥速度/位移阈值系数（人向上挥天然比向下慢）
 DIRECTION_SUPPRESS_MS = 800         # 触发一个方向后，禁止反方向触发的时长（ms）
 FIST_HOLD_FRAMES = 5                # 握拳需持续N帧后才允许画圈判定
+STILL_DISPERSION_THRESHOLD = 0.015  # 窗口前部Y值分布<此值→判定为静止起始，过滤乱动
 
 # ============================================================
 # Savitzky-Golay 滤波参数
